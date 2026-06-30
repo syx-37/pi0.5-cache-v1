@@ -105,8 +105,14 @@ class Pi0Adapter(VLAModelBase):
         if use_vla_cache:
             if not self._vla_cache_logged:
                 import logging
+                stage = str(self.config.get("vla_cache_stage", "token_stats"))
+                real_kv_enabled = bool(stage == "real_kv" or self.config.get("vla_cache_real_kv", False))
+                if real_kv_enabled:
+                    message = "[VLA-Cache] Stage 2A real KV overwrite reuse enabled; token skipping is disabled."
+                else:
+                    message = "[VLA-Cache] visual-token compression statistics enabled; model outputs are unchanged."
                 logging.getLogger("embodied_ai").info(
-                    "[VLA-Cache] visual-token compression statistics enabled; model outputs are unchanged."
+                    message
                 )
                 self._vla_cache_logged = True
 

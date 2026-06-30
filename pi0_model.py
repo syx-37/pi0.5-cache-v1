@@ -180,9 +180,11 @@ class OpenPi0Config(Pi0Config, DAPCModelConfig):
     action_env_dim: int = 7                   # Environment action dimension (override via YAML model.action_dim)
     camera_map: dict = field(default_factory=dict)  # {pi0_slot: unified_cam} override (empty = default)
     use_vla_cache: bool = False               # Enable VLA-Cache visual-token statistics / later KV reuse
-    vla_cache_stage: str = "token_stats"      # token_stats/static_selection; both are stats-only in this patch
+    vla_cache_stage: str = "token_stats"      # token_stats/static_selection/real_kv
     vla_cache_sim_threshold: float = 0.996    # Cosine threshold for theoretical visual-token reuse
     vla_cache_log_interval: int = 50          # Print/cache-stat aggregation interval
+    vla_cache_real_kv: bool = False           # Enable Stage 2A position-based KV overwrite
+    vla_cache_skip_tokens: bool = False       # Reserved for Stage 2B; Stage 2A must keep this False
     num_steps: int = 10                       # Flow-matching denoising steps
     train_expert_only: bool = False           # Whether to only train the expert network (freeze VLM)
     safe_get_logprob: bool = False            # Use simplified logprob computation
@@ -371,36 +373,17 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy, DAPCMixin, PrefixCach
         if not isinstance(img_masks, Sequence):
             return []
 
+        # Server pi0.5 keeps three possible image slots in the prefix-value
+        # path, while LIBERO normally enables only num_images_in_input of them.
+        # Each SigLIP image slot contributes 256 patch tokens.
+        image_token_len = 256
+        num_effective_images = int(getattr(self.config, "num_images_in_input", len(img_masks)))
+        num_slots = max(len(img_masks), num_effective_images)
         counts = []
-        lang_len = int(lang_tokens.shape[1]) if lang_tokens is not None and hasattr(lang_tokens, "shape") else 0
-        total_prefix_len = int(prefix_embs.shape[1])
-        visual_total = max(total_prefix_len - lang_len, 0)
 
-        valid_images = 0
-        for mask in img_masks:
-            if mask is None:
-                continue
-            if torch.is_tensor(mask):
-                if bool(mask.detach().bool().any().item()):
-                    valid_images += 1
-            elif bool(mask):
-                valid_images += 1
-
-        if valid_images <= 0:
-            return counts
-
-        per_image = visual_total // valid_images
-        remainder = visual_total % valid_images
-        for mask in img_masks:
-            is_valid = False
-            if mask is not None:
-                if torch.is_tensor(mask):
-                    is_valid = bool(mask.detach().bool().any().item())
-                else:
-                    is_valid = bool(mask)
-            if is_valid:
-                counts.append(per_image + (1 if remainder > 0 else 0))
-                remainder = max(remainder - 1, 0)
+        for camera_idx in range(num_slots):
+            if camera_idx < num_effective_images:
+                counts.append(image_token_len)
             else:
                 counts.append(0)
         return counts
@@ -1022,18 +1005,17 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy, DAPCMixin, PrefixCach
         # benchmarking on newer torch where this may be fixed.
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = self._attn_impl
 
-        (prefix_output, _), past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
-        )
-
         vla_cache_stats = None
+        prefix_past_key_values = None
+        vla_cache_real_kv_enabled = False
         if use_vla_cache and vla_cache_state is not None:
             stage = getattr(vla_cache_state, "stage", getattr(self.config, "vla_cache_stage", "token_stats"))
-            if stage in {"token_stats", "static_selection"}:
+            vla_cache_real_kv_enabled = bool(
+                stage == "real_kv" or getattr(self.config, "vla_cache_real_kv", False)
+            )
+            if vla_cache_real_kv_enabled and bool(getattr(self.config, "vla_cache_skip_tokens", False)):
+                raise ValueError("Stage 2A supports KV reuse without token skipping; set vla_cache_skip_tokens=false.")
+            if stage in {"token_stats", "static_selection", "real_kv"} or vla_cache_real_kv_enabled:
                 image_token_counts = self._vla_cache_image_token_counts(prefix_embs, lang_tokens, img_masks)
                 sim_threshold = float(
                     getattr(vla_cache_state, "sim_threshold", getattr(self.config, "vla_cache_sim_threshold", 0.996))
@@ -1045,6 +1027,24 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy, DAPCMixin, PrefixCach
                     image_token_counts=image_token_counts,
                     sim_threshold=sim_threshold,
                 )
+            if vla_cache_real_kv_enabled:
+                prefix_past_key_values = vla_cache_state.prepare_real_kv_cache(
+                    expected_seq_len=int(prefix_embs.shape[1])
+                )
+
+        (prefix_output, _), past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=prefix_past_key_values,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+
+        if vla_cache_real_kv_enabled and vla_cache_state is not None:
+            real_kv_stats = vla_cache_state.store_real_kv_cache(past_key_values)
+            if vla_cache_stats is None:
+                vla_cache_stats = {}
+            vla_cache_stats.update(real_kv_stats)
 
         # Denoising phase: step by step from x_T to x_0
         x_t = noise
@@ -1698,6 +1698,8 @@ def load_pi0_model(cfg) -> OpenPi0ForRLActionPrediction:
         "vla_cache_stage",
         "vla_cache_sim_threshold",
         "vla_cache_log_interval",
+        "vla_cache_real_kv",
+        "vla_cache_skip_tokens",
     ):
         if cfg.get(key) is not None:
             actor_model_config.__dict__[key] = cfg[key]

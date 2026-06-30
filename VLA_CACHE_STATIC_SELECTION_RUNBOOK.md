@@ -145,7 +145,7 @@ cd /media/SSD7/syx/projects/EAI-main
 python scripts/evaluate.py \
   --config-name=pi05_eval_libero \
   model.model_path=/media/SSD7/syx/projects/EAI-main/RLinf-Pi05-PPO-LIBERO-130 \
-  model.use_vla_cache=false \
+  +model.use_vla_cache=false \
   num_gpus=1 \
   env.total_num_envs=10 \
   env.task_suite=libero_spatial \
@@ -164,10 +164,10 @@ cd /media/SSD7/syx/projects/EAI-main
 python scripts/evaluate.py \
   --config-name=pi05_eval_libero \
   model.model_path=/media/SSD7/syx/projects/EAI-main/RLinf-Pi05-PPO-LIBERO-130 \
-  model.use_vla_cache=true \
-  model.vla_cache_stage=static_selection \
-  model.vla_cache_sim_threshold=0.996 \
-  model.vla_cache_log_interval=50 \
+  +model.use_vla_cache=true \
+  +model.vla_cache_stage=static_selection \
+  +model.vla_cache_sim_threshold=0.996 \
+  +model.vla_cache_log_interval=50 \
   num_gpus=1 \
   env.total_num_envs=10 \
   env.task_suite=libero_spatial \
@@ -179,9 +179,9 @@ python scripts/evaluate.py \
 如果你想测不同阈值，可以只改这一项：
 
 ```bash
-model.vla_cache_sim_threshold=0.995
-model.vla_cache_sim_threshold=0.997
-model.vla_cache_sim_threshold=0.999
++model.vla_cache_sim_threshold=0.995
++model.vla_cache_sim_threshold=0.997
++model.vla_cache_sim_threshold=0.999
 ```
 
 ## 10. 生成压缩率和成功率表格
