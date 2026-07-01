@@ -72,9 +72,110 @@ def _compat_layernorm(layernorm, x, cond=None):
     return result, None
 
 
+def _compact_vla_cache_queries(hidden_states, attention_mask, position_ids, skip_plan):
+    """Compact per-sample query tokens for Stage 2B visual-token skipping."""
+    if not skip_plan or not skip_plan.get("enabled", False):
+        return hidden_states, attention_mask, position_ids, None, None, None
+
+    keep_mask = skip_plan.get("keep_token_mask")
+    if keep_mask is None:
+        return hidden_states, attention_mask, position_ids, None, None, None
+
+    batch_size, seq_len, hidden_dim = hidden_states.shape
+    keep_mask = keep_mask.to(device=hidden_states.device, dtype=torch.bool)
+    if tuple(keep_mask.shape) != (batch_size, seq_len):
+        return hidden_states, attention_mask, position_ids, None, None, None
+    if not bool((~keep_mask).any().item()):
+        return hidden_states, attention_mask, position_ids, None, None, None
+
+    kept_counts = keep_mask.sum(dim=1)
+    max_kept = int(kept_counts.max().item())
+    if max_kept <= 0:
+        return hidden_states, attention_mask, position_ids, None, None, None
+
+    full_indices = torch.arange(seq_len, device=hidden_states.device, dtype=torch.long)
+    gather_indices = torch.zeros((batch_size, max_kept), device=hidden_states.device, dtype=torch.long)
+    valid_mask = torch.zeros((batch_size, max_kept), device=hidden_states.device, dtype=torch.bool)
+    for batch_idx in range(batch_size):
+        indices = full_indices[keep_mask[batch_idx]]
+        count = int(indices.numel())
+        gather_indices[batch_idx, :count] = indices
+        valid_mask[batch_idx, :count] = True
+
+    compact_hidden = hidden_states.gather(
+        1,
+        gather_indices[:, :, None].expand(batch_size, max_kept, hidden_dim),
+    )
+    compact_position_ids = position_ids.gather(1, gather_indices).masked_fill(~valid_mask, 0)
+    compact_cache_position = gather_indices.masked_fill(~valid_mask, 0)
+
+    compact_attention_mask = attention_mask
+    if attention_mask is not None and attention_mask.dim() == 4:
+        gather_index = gather_indices[:, None, :, None].expand(
+            batch_size,
+            attention_mask.shape[1],
+            max_kept,
+            attention_mask.shape[-1],
+        )
+        compact_attention_mask = attention_mask.gather(2, gather_index)
+        compact_attention_mask = torch.where(
+            valid_mask[:, None, :, None],
+            compact_attention_mask,
+            torch.zeros_like(compact_attention_mask),
+        )
+
+    restore_state = {
+        "gather_indices": gather_indices,
+        "valid_mask": valid_mask,
+        "prev_prefix_output": skip_plan.get("prev_prefix_output"),
+        "full_seq_len": int(seq_len),
+    }
+    skip_stats = dict(skip_plan.get("stats", {}) or {})
+    skip_stats.update(
+        {
+            "skip_start_layer": int(skip_plan.get("skip_start_layer", -1)),
+            "max_kept_token_positions": int(kept_counts.max().item()),
+            "min_kept_token_positions": int(kept_counts.min().item()),
+        }
+    )
+    return compact_hidden, compact_attention_mask, compact_position_ids, compact_cache_position, valid_mask, (
+        restore_state,
+        skip_stats,
+    )
+
+
+def _restore_vla_cache_queries(hidden_states, restore_state):
+    """Restore compacted Stage 2B hidden states to full prefix length."""
+    if restore_state is None:
+        return hidden_states
+
+    gather_indices = restore_state["gather_indices"]
+    valid_mask = restore_state["valid_mask"]
+    prev_prefix_output = restore_state.get("prev_prefix_output")
+    batch_size = hidden_states.shape[0]
+    full_seq_len = int(restore_state["full_seq_len"])
+    hidden_dim = hidden_states.shape[-1]
+
+    if (
+        prev_prefix_output is not None
+        and tuple(prev_prefix_output.shape[:2]) == (batch_size, full_seq_len)
+        and int(prev_prefix_output.shape[-1]) == hidden_dim
+    ):
+        full_hidden = prev_prefix_output.to(device=hidden_states.device, dtype=hidden_states.dtype).clone()
+    else:
+        full_hidden = hidden_states.new_zeros((batch_size, full_seq_len, hidden_dim))
+
+    for batch_idx in range(batch_size):
+        valid = valid_mask[batch_idx]
+        if not bool(valid.any().item()):
+            continue
+        full_hidden[batch_idx, gather_indices[batch_idx, valid]] = hidden_states[batch_idx, valid]
+    return full_hidden
+
+
 def _single_model_forward(model, hidden_states, attention_mask, position_ids,
                           past_key_values, use_cache, adarms_cond=None,
-                          gradient_checkpointing=False):
+                          gradient_checkpointing=False, vla_cache_skip_plan=None):
     """Process hidden_states through a GemmaModel's decoder layers.
 
     统一使用标准 GemmaDecoderLayer.forward()（对齐 RLinf），不再手动拆解 attention。
@@ -97,6 +198,10 @@ def _single_model_forward(model, hidden_states, attention_mask, position_ids,
     cache = None
     if use_cache:
         cache = DynamicCache() if past_key_values is None else past_key_values
+        if hasattr(cache, "vla_cache_update_mask"):
+            cache.vla_cache_update_mask = None
+        if hasattr(cache, "vla_cache_skip_stats"):
+            cache.vla_cache_skip_stats = {}
     cache_position = None
     if use_cache:
         cache_position = torch.arange(
@@ -122,8 +227,31 @@ def _single_model_forward(model, hidden_states, attention_mask, position_ids,
         and not use_cache
         and past_key_values is None
     )
+    skip_start_layer = None
+    if use_cache and vla_cache_skip_plan and vla_cache_skip_plan.get("enabled", False):
+        skip_start_layer = int(vla_cache_skip_plan.get("skip_start_layer", 2))
+    restore_state = None
+    compacted = False
 
     for idx, decoder_layer in enumerate(model.layers):
+        if use_cache and skip_start_layer is not None and not compacted and idx >= skip_start_layer:
+            (
+                hidden_states,
+                attention_mask,
+                position_ids,
+                cache_position,
+                update_mask,
+                restore_bundle,
+            ) = _compact_vla_cache_queries(hidden_states, attention_mask, position_ids, vla_cache_skip_plan)
+            if restore_bundle is not None:
+                restore_state, skip_stats = restore_bundle
+                compacted = True
+                position_embeddings = model.rotary_emb(hidden_states, position_ids)
+                if hasattr(cache, "vla_cache_update_mask"):
+                    cache.vla_cache_update_mask = update_mask
+                if hasattr(cache, "vla_cache_skip_stats"):
+                    cache.vla_cache_skip_stats = skip_stats
+
         if apply_gc:
             # Per-layer gradient checkpointing.
             # _idx=idx 冻结循环变量，避免 Python closure-in-loop 捕获 bug。
@@ -162,6 +290,8 @@ def _single_model_forward(model, hidden_states, attention_mask, position_ids,
 
     # Final norm
     hidden_states, _ = _compat_layernorm(model.norm, hidden_states, cond=adarms_cond)
+    if compacted:
+        hidden_states = _restore_vla_cache_queries(hidden_states, restore_state)
 
     return hidden_states, cache
 # ───────────────────────────────────────────────────────────────────────────────
@@ -272,6 +402,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] | None = None,
         use_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
+        vla_cache_skip_plan: dict | None = None,
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
@@ -295,6 +426,7 @@ class PaliGemmaWithExpertModel(nn.Module):
                 vlm_model, inputs_embeds[0], attention_mask, position_ids,
                 past_key_values, use_cache, adarms_cond=adarms_cond[0],
                 gradient_checkpointing=_expert_gc,
+                vla_cache_skip_plan=vla_cache_skip_plan,
             )
             suffix_output = None
         elif inputs_embeds[0] is None:

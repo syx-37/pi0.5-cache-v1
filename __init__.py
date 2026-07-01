@@ -107,7 +107,10 @@ class Pi0Adapter(VLAModelBase):
                 import logging
                 stage = str(self.config.get("vla_cache_stage", "token_stats"))
                 real_kv_enabled = bool(stage == "real_kv" or self.config.get("vla_cache_real_kv", False))
-                if real_kv_enabled:
+                skip_tokens_enabled = bool(real_kv_enabled and self.config.get("vla_cache_skip_tokens", False))
+                if skip_tokens_enabled:
+                    message = "[VLA-Cache] Stage 2B real visual-token skipping enabled."
+                elif real_kv_enabled:
                     message = "[VLA-Cache] Stage 2A real KV overwrite reuse enabled; token skipping is disabled."
                 else:
                     message = "[VLA-Cache] visual-token compression statistics enabled; model outputs are unchanged."

@@ -185,6 +185,8 @@ class OpenPi0Config(Pi0Config, DAPCModelConfig):
     vla_cache_log_interval: int = 50          # Print/cache-stat aggregation interval
     vla_cache_real_kv: bool = False           # Enable Stage 2A position-based KV overwrite
     vla_cache_skip_tokens: bool = False       # Reserved for Stage 2B; Stage 2A must keep this False
+    vla_cache_pruning_layers: list = field(default_factory=lambda: [2, 6, 9, 11])  # Stage 2B skip start candidates
+    vla_cache_top_k_per_camera: int = 150     # Stage 2B max skipped visual tokens per camera/env
     num_steps: int = 10                       # Flow-matching denoising steps
     train_expert_only: bool = False           # Whether to only train the expert network (freeze VLM)
     safe_get_logprob: bool = False            # Use simplified logprob computation
@@ -1007,18 +1009,26 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy, DAPCMixin, PrefixCach
 
         vla_cache_stats = None
         prefix_past_key_values = None
+        vla_cache_skip_plan = None
         vla_cache_real_kv_enabled = False
+        vla_cache_skip_tokens_enabled = False
         if use_vla_cache and vla_cache_state is not None:
             stage = getattr(vla_cache_state, "stage", getattr(self.config, "vla_cache_stage", "token_stats"))
             vla_cache_real_kv_enabled = bool(
                 stage == "real_kv" or getattr(self.config, "vla_cache_real_kv", False)
             )
-            if vla_cache_real_kv_enabled and bool(getattr(self.config, "vla_cache_skip_tokens", False)):
-                raise ValueError("Stage 2A supports KV reuse without token skipping; set vla_cache_skip_tokens=false.")
+            vla_cache_skip_tokens_enabled = bool(
+                vla_cache_real_kv_enabled and getattr(self.config, "vla_cache_skip_tokens", False)
+            )
             if stage in {"token_stats", "static_selection", "real_kv"} or vla_cache_real_kv_enabled:
                 image_token_counts = self._vla_cache_image_token_counts(prefix_embs, lang_tokens, img_masks)
                 sim_threshold = float(
                     getattr(vla_cache_state, "sim_threshold", getattr(self.config, "vla_cache_sim_threshold", 0.996))
+                )
+                top_k_per_camera = (
+                    int(getattr(self.config, "vla_cache_top_k_per_camera", 150))
+                    if vla_cache_skip_tokens_enabled
+                    else None
                 )
                 vla_cache_stats = vla_cache_state.record_prefix_step(
                     prefix_embs=prefix_embs,
@@ -1026,11 +1036,19 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy, DAPCMixin, PrefixCach
                     img_masks=img_masks,
                     image_token_counts=image_token_counts,
                     sim_threshold=sim_threshold,
+                    top_k_per_camera=top_k_per_camera,
+                    enable_skip_mask=vla_cache_skip_tokens_enabled,
                 )
             if vla_cache_real_kv_enabled:
                 prefix_past_key_values = vla_cache_state.prepare_real_kv_cache(
-                    expected_seq_len=int(prefix_embs.shape[1])
+                    expected_seq_len=int(prefix_embs.shape[1]),
+                    skip_tokens=vla_cache_skip_tokens_enabled,
                 )
+                if vla_cache_skip_tokens_enabled:
+                    vla_cache_skip_plan = vla_cache_state.build_skip_plan(
+                        expected_seq_len=int(prefix_embs.shape[1]),
+                        pruning_layers=getattr(self.config, "vla_cache_pruning_layers", [2, 6, 9, 11]),
+                    )
 
         (prefix_output, _), past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
@@ -1038,10 +1056,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy, DAPCMixin, PrefixCach
             past_key_values=prefix_past_key_values,
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
+            vla_cache_skip_plan=vla_cache_skip_plan,
         )
 
         if vla_cache_real_kv_enabled and vla_cache_state is not None:
-            real_kv_stats = vla_cache_state.store_real_kv_cache(past_key_values)
+            real_kv_stats = vla_cache_state.store_real_kv_cache(past_key_values, prefix_output=prefix_output)
             if vla_cache_stats is None:
                 vla_cache_stats = {}
             vla_cache_stats.update(real_kv_stats)
@@ -1700,6 +1719,8 @@ def load_pi0_model(cfg) -> OpenPi0ForRLActionPrediction:
         "vla_cache_log_interval",
         "vla_cache_real_kv",
         "vla_cache_skip_tokens",
+        "vla_cache_pruning_layers",
+        "vla_cache_top_k_per_camera",
     ):
         if cfg.get(key) is not None:
             actor_model_config.__dict__[key] = cfg[key]
